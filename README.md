@@ -27,8 +27,22 @@ DantaOnBoardTest/
 ├── README.md              ← this file
 ├── TODO.md                ← task checklist (Chinese)
 ├── DockerDecision.md     ← decision write-up for the project lead (Chinese)
+├── deploy.sh              ← rebuild + redeploy script (image, backend, restart)
+├── sandboxctl.sh          ← control script (create/send/delete/list by name)
 ├── backend/               ← Go backend (3 endpoints)
 └── pingpong/              ← in-sandbox pingpong service + Dockerfile
+```
+
+## Scripts
+
+```bash
+./deploy.sh                  # rebuild image + backend, restart, health check
+./deploy.sh --no-build       # backend-only redeploy (skip docker build)
+./sandboxctl.sh create demo  # create sandbox, register name "demo"
+./sandboxctl.sh send demo hello
+./sandboxctl.sh delete demo
+./sandboxctl.sh list         # name mapping (stored in sandboxes.map)
+./sandboxctl.sh              # interactive menu
 ```
 
 ## API contract (fixed; provider swappable)
