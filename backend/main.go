@@ -1,11 +1,13 @@
-// backend — 沙盒管理后端（Docker Provider MVP）
-// 三个接口：
-//   POST   /sandbox         创建沙盒 -> {"sandbox_id": "...", "addr": "..."}
-//   DELETE /sandbox/{id}    删除沙盒
+// backend — sandbox management backend (Docker Provider MVP)
+//
+// Three endpoints:
+//   POST   /sandbox            create sandbox -> {"sandbox_id": "...", "addr": "..."}
+//   DELETE /sandbox/{id}       delete sandbox
 //   POST   /sandbox/{id}/ping  body {"message": "..."} -> {"reply": "<msg> -sandbox- <id>"}
 //
-// 说明：当前用 Docker CLI 作为"沙盒"实现（沙盒后端），接口契约与未来
-// 换 CubeSandbox 时保持一致，届时只需替换 createSandbox/deleteSandbox 内部实现。
+// Note: "sandbox" is currently a Docker container managed via the docker CLI.
+// The API contract stays unchanged if the sandbox backend is later swapped to
+// CubeSandbox — only createSandbox/deleteSandbox internals change.
 package main
 
 import (
@@ -24,7 +26,7 @@ const image = "pingpong:latest"
 
 var (
 	mu    sync.RWMutex
-	ports = map[string]string{} // sandbox_id -> 宿主机端口
+	ports = map[string]string{} // sandbox_id -> host port
 )
 
 type createResp struct {
@@ -36,7 +38,7 @@ type pingResp struct {
 	Reply string `json:"reply"`
 }
 
-// sh 执行 docker 命令，返回 trim 后的输出
+// sh runs a docker command and returns trimmed output.
 func sh(args ...string) (string, error) {
 	out, err := exec.Command("docker", args...).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
@@ -52,14 +54,15 @@ func createSandbox(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("s%d", time.Now().UnixNano()%100000000)
 	name := "sbx-" + id
 
-	// 创建沙盒（-p 49999 不带宿主端口 => 自动分配随机端口，天然避免冲突）
+	// Create the sandbox; "-p 49999" without a host port binds a random host
+	// port, so concurrent creates never conflict.
 	if out, err := sh("run", "-d", "--name", name,
 		"-e", "SANDBOX_ID="+id, "-p", "49999", image); err != nil {
 		http.Error(w, "create failed: "+out, http.StatusInternalServerError)
 		return
 	}
 
-	// 查映射端口：docker port <name> 49999 -> "0.0.0.0:32768"
+	// Resolve the mapped port: docker port <name> 49999 -> "0.0.0.0:32768"
 	out, err := sh("port", name, "49999")
 	if err != nil {
 		http.Error(w, "port lookup failed: "+out, http.StatusInternalServerError)
@@ -120,7 +123,7 @@ func pingSandbox(w http.ResponseWriter, r *http.Request) {
 		msg = "ping"
 	}
 
-	// 转发到沙盒内服务，原样取回签名消息
+	// Forward to the sandbox service and return the signed message as-is.
 	resp, err := http.Post("http://127.0.0.1:"+hostPort+"/", "text/plain",
 		strings.NewReader(msg))
 	if err != nil {

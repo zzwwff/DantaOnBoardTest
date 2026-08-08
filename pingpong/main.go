@@ -1,5 +1,5 @@
-// pingpong — 沙箱内常驻服务
-// 监听 :49999，收到请求返回 "原消息 -sandbox- <沙箱ID>"
+// pingpong — long-lived in-sandbox service.
+// Listens on :49999; replies with "<original message> -sandbox- <sandboxID>".
 package main
 
 import (
@@ -24,6 +24,7 @@ func main() {
 		fmt.Fprintf(w, "%s -sandbox- %s", msg, sandboxID)
 	})
 
-	// 长期驻留：进程前台运行，容器不删就一直活着
+	// Long residency: the process runs in the foreground; the container stays
+	// alive until it is removed by the backend.
 	http.ListenAndServe(":49999", nil)
 }

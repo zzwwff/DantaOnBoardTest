@@ -1,65 +1,62 @@
-# OnBoard Test — CubeSandbox MVP 验证
+# Danta OnBoard Test — Sandbox MVP (Docker)
 
-在测试服务器上部署 CubeSandbox 沙盒集群，实现最小可用的"一人一沙盒"雏形。
+Proof-of-concept for the Danta "one sandbox per user" AI onboarding experience, running on the test server `claw`.
 
-## 目标（四个能力）
+## Goals (4 capabilities)
 
-1. **新建沙盒** — 后端创建沙盒实例，返回 `sandbox_id`
-2. **删除沙盒** — 后端销毁指定沙盒
-3. **与指定沙盒沟通** — pingpong：发一条消息，沙盒返回"消息 + 沙盒ID 签名"
-4. **长期驻留** — 沙盒不因空闲被回收（timeout = `NEVER_TIMEOUT`）
+1. **Create sandbox** — backend creates a sandbox instance and returns a `sandbox_id`
+2. **Delete sandbox** — backend destroys the specified sandbox
+3. **Communicate with a sandbox** — pingpong: send a message, the sandbox replies with "message + sandbox-ID signature"
+4. **Long-term residency** — the sandbox stays alive across idle periods (no idle reaper)
 
-## 架构
+## Current implementation (Docker MVP)
 
-```
-后端 (backend/)
-  ├─ REST → CubeAPI :3000     创建/删除沙盒
-  └─ HTTP → CubeProxy :443    沟通（按 Host 头路由到沙箱内端口）
-              │
-        <port>-<sandbox_id>.<domain>
-              │
-       沙箱 (MicroVM，独立内核)
-         ├─ envd :49983    （平台自带，供平台管理沙箱）
-         └─ pingpong :49999（由 pingpong/ 目录构建的镜像提供）
-```
+CubeSandbox (microVM) is **not runnable on the test server `claw`**: it is an LXC container on PVE — no `/dev/kvm`, the disk is ext4 (not XFS), and the host kernel cannot be changed from inside a container. The PVM mode fails the same preconditions.
 
-## 目录结构
+Approved alternative: **one sandbox per user as a Docker container** — the industry-standard pattern used by OpenClaw's official multi-tenant solution (`openclaw fleet`, per-tenant hardened containers) and community projects (e.g. ClawHuddle). The full decision write-up is in `DockerDecision.md` (Chinese).
 
 ```
-OnBoardTest/
-├── README.md       ← 本文档（整体说明）
-├── TODO.md         ← 任务清单
-├── backend/        ← Go 后端服务（3 个接口）
-└── pingpong/       ← 沙箱内 pingpong 服务 + Dockerfile
+Caller → HTTP → backend (Go) :8080 ── docker CLI ──► sandbox container (per user)
+                                                     └─ random host port, HTTP :49999 inside
 ```
 
-## 通信链路（核心是 HTTP）
+## Directory structure
 
-| 动作 | 路径 | 说明 |
+```
+DantaOnBoardTest/
+├── README.md              ← this file
+├── TODO.md                ← task checklist (Chinese)
+├── DockerDecision.md     ← decision write-up for the project lead (Chinese)
+├── backend/               ← Go backend (3 endpoints)
+└── pingpong/              ← in-sandbox pingpong service + Dockerfile
+```
+
+## API contract (fixed; provider swappable)
+
+| Method | Path | Behavior |
 |---|---|---|
-| 创建/删除沙盒 | 后端 → CubeAPI (`:3000`) | E2B 兼容 REST API |
-| pingpong 沟通 | 后端 → CubeProxy (`:443`) | mkcert TLS，按 Host 头 `<port>-<id>.<domain>` 路由进沙箱内 `:49999` |
+| POST | `/sandbox` | Create sandbox → `{"sandbox_id": "...", "addr": "http://127.0.0.1:<port>"}` |
+| DELETE | `/sandbox/{id}` | Delete sandbox |
+| POST | `/sandbox/{id}/ping` | body `{"message": "..."}` → `{"reply": "<message> -sandbox- <id>"}` |
 
-## 路线图概览
+The contract stays unchanged when the sandbox backend is later swapped to CubeSandbox/microVM — only the internal implementation of `createSandbox`/`deleteSandbox` changes.
 
-1. 检查测试机硬件（KVM / 内存 / 磁盘）→ 决定安装模式
-2. 一键安装 CubeSandbox 集群
-3. 写 pingpong 服务 → 构建镜像 → 本地 registry → 创建模板
-4. 写 Go 后端三个接口
-5. 配置联调：CA 证书、域名解析、NEVER_TIMEOUT
-6. 端到端验证 + 长期驻留验证
+## Roadmap
 
-详细步骤见 [TODO.md](TODO.md)。
+1. ✅ Environment check on `claw` — Docker 28.2.2, Go 1.22.2, ports 8080/49999 free
+2. Build the pingpong image → build & run the backend → end-to-end verification
+3. Long-residency check (overnight)
+4. Later: per-user OpenClaw image (read-only base layer + writable user volume), then upgrade isolation (gVisor → microVM on a dedicated VM with KVM)
 
-## 验收标准
+## Acceptance criteria
 
-- [ ] 能创建一个沙盒并返回 `sandbox_id`
-- [ ] 能对指定沙盒 ping，返回"原消息 + `-sandbox-` + 沙盒ID"
-- [ ] 沙盒存活过夜后仍可 ping（长期驻留成立）
-- [ ] 能删除沙盒
-- [ ] 沙盒删除后重建，可写层数据保留
+- [ ] Create returns `sandbox_id`; container visible in `docker ps`
+- [ ] Ping returns "message + `-sandbox-` + id" (signature round-trip proves routing)
+- [ ] Sandbox stays alive overnight and is still pingable
+- [ ] Delete removes the container
+- [ ] Per-instance memory recorded (`docker stats`)
 
-## 时间估计
+## Status
 
-- 测试机有 KVM：2~3 天
-- 无 KVM 走 PVM 模式：+1 天
+- Code: ready (`pingpong/`, `backend/`)
+- Deployment & verification: in progress on `claw`
