@@ -62,13 +62,16 @@ func createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the mapped port: docker port <name> 49999 -> "0.0.0.0:32768"
+	// Resolve the mapped port: "docker port <name> 49999" prints one line per
+	// bound address (e.g. "0.0.0.0:32768" and "[::]:32768"); take the first.
 	out, err := sh("port", name, "49999")
 	if err != nil {
 		http.Error(w, "port lookup failed: "+out, http.StatusInternalServerError)
 		return
 	}
-	hostPort := strings.TrimPrefix(out, "0.0.0.0:")
+	first := strings.SplitN(out, "\n", 2)[0]
+	hostPort := strings.TrimPrefix(first, "0.0.0.0:")
+	hostPort = strings.TrimPrefix(hostPort, "[::]:")
 
 	mu.Lock()
 	ports[id] = hostPort
