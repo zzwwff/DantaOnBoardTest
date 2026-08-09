@@ -81,6 +81,9 @@ func randomHex(n int) string {
 func writeConfig(cfgPath, token, apiKey string) error {
 	cfg := map[string]any{
 		"gateway": map[string]any{
+			// required by the gateway on start; otherwise it refuses to boot
+			// ("existing config is missing gateway.mode")
+			"mode": "local",
 			"auth": map[string]any{
 				"mode":  "token",
 				"token": token,
@@ -99,7 +102,9 @@ func writeConfig(cfgPath, token, apiKey string) error {
 					"apiKey":  apiKey,
 					"api":     "openai-completions",
 					"models": []any{
-						map[string]any{"id": "deepseek-chat", "contextWindow": 128000, "maxOutput": 8192},
+						// "name" is required by the config validator
+						map[string]any{"id": "deepseek-chat", "name": "DeepSeek Chat",
+							"contextWindow": 128000, "maxOutput": 8192},
 					},
 				},
 			},
@@ -107,7 +112,6 @@ func writeConfig(cfgPath, token, apiKey string) error {
 		"agents": map[string]any{
 			"defaults": map[string]any{
 				"model": map[string]any{"primary": "deepseek/deepseek-chat"},
-				"models": map[string]any{"allow": []any{"deepseek/deepseek-chat"}},
 			},
 		},
 	}
@@ -147,7 +151,7 @@ func newSandbox() (*sandbox, error) {
 		return nil, err
 	}
 
-	token := randomHex(16)
+	token := randomHex(32) // 64 hex chars, same length as "openssl rand -hex 32"
 	cfgPath := filepath.Join(base, "openclaw.json")
 	if err := writeConfig(cfgPath, token, apiKey); err != nil {
 		return nil, err
@@ -181,10 +185,13 @@ func newSandbox() (*sandbox, error) {
 	sb := &sandbox{id: id, port: port, token: token, dataDir: base}
 
 	// Wait for the gateway to serve /v1/models before returning, so the first
-	// chat request never races the container boot.
-	if err := sb.waitReady(120 * time.Second); err != nil {
-		sh("rm", "-f", name)
-		return nil, err
+	// chat request never races the container boot. On failure the container is
+	// kept (not removed) and its log tail is embedded in the error, so the
+	// cause is visible without a manual "docker logs" round trip.
+	if err := sb.waitReady(60 * time.Second); err != nil {
+		logs, _ := sh("logs", "--tail", "20", name)
+		fmt.Printf("sandbox %s failed to become ready, kept for inspection: docker logs %s\n", id, name)
+		return nil, fmt.Errorf("%v\n--- container log tail ---\n%s", err, logs)
 	}
 	return sb, nil
 }

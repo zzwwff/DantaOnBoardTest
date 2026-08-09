@@ -48,4 +48,5 @@
 - **容器内 user**：OpenClaw 镜像以 node（uid 1000）运行，数据目录需 chown 1000:1000，backend 已处理；若后续镜像改 uid 需同步改
 - **首次回复慢**：沙盒冷启动 + DeepSeek 推理，第一条消息 1-2 分钟属正常（前端有"思考中"提示）
 - **DeepSeek 模型引用**：用 `deepseek/deepseek-chat`（provider/model 格式）；若报 Unknown model，容器内跑 `openclaw models list` 排查
+- **openclaw.json 校验严格**（实测）：模型条目必须带 `name` 字段；`agents.defaults.models.allow` 会被拒（已从生成配置移除）；`gateway.mode` 必填（设为 `local`）
 - 后端当前无鉴权、只绑 127.0.0.1，暴露公网前需加 token（对应项目"openclaw 专用凭证"）

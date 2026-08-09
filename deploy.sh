@@ -59,9 +59,10 @@ echo "==> [4/6] compiling backend"
 (cd backend && go build -o ../build/backend .)
 
 echo "==> [5/6] restarting backend"
-# stop any previous backend: new layout is ./build/backend, the milestone-1 one
-# was ./backend started from the backend/ dir — one pattern matches both
-pkill -f '\./backend' 2>/dev/null || true
+# stop any previous backend on :8080 — '/backend' matches every binary layout
+# (./backend, ./build/backend), unlike path-specific patterns that silently
+# miss one layout and leave the old process holding the port
+pkill -f '/backend' 2>/dev/null || true
 sleep 1
 DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" nohup ./build/backend > build/backend.log 2>&1 &
 sleep 1
@@ -69,7 +70,7 @@ ss -tlnp | grep -q 8080 || { echo "error: backend not listening"; tail -20 build
 
 echo "==> [6/6] health check: send one chat message"
 echo "    (first reply includes the sandbox boot — can take 1-2 min)"
-curl -s -X POST localhost:8080/api/chat \
+curl -s --max-time 180 -X POST localhost:8080/api/chat \
   -H 'Content-Type: application/json' \
   -d '{"message":"hi, reply with: pong"}'
 echo
