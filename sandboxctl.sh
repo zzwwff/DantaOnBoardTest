@@ -21,7 +21,10 @@ MAP_FILE="${SANDBOX_MAP:-./build/sandboxes.map}"   # runtime state, gitignored
 mkdir -p "$(dirname "$MAP_FILE")"
 
 # name <tab> sandbox_id <tab> addr   (one line per sandbox)
-sid_of() { grep -P "^$1\t" "$MAP_FILE" | cut -f2 | head -1; }
+sid_of() {
+  [ -f "$MAP_FILE" ] || return 0   # first run: map file doesn't exist yet
+  grep -P "^$1\t" "$MAP_FILE" | cut -f2 | head -1
+}
 
 create() {
   local name="$1"
