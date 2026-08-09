@@ -52,7 +52,8 @@ type sandbox struct {
 
 var (
 	mu      sync.Mutex
-	current *sandbox // the active sandbox (single-chat MVP)
+	current *sandbox                // active sandbox for the web-chat flow
+	byID    = map[string]*sandbox{} // all live sandboxes, keyed by id
 )
 
 type createResp struct {
@@ -102,9 +103,10 @@ func writeConfig(cfgPath, token, apiKey string) error {
 					"apiKey":  apiKey,
 					"api":     "openai-completions",
 					"models": []any{
-						// "name" is required by the config validator
+						// fields per the official ModelDefinitionSchema:
+						// id/name/reasoning/input/cost/contextWindow/maxTokens
 						map[string]any{"id": "deepseek-chat", "name": "DeepSeek Chat",
-							"contextWindow": 128000, "maxOutput": 8192},
+							"contextWindow": 128000, "maxTokens": 8192},
 					},
 				},
 			},
@@ -193,6 +195,9 @@ func newSandbox() (*sandbox, error) {
 		fmt.Printf("sandbox %s failed to become ready, kept for inspection: docker logs %s\n", id, name)
 		return nil, fmt.Errorf("%v\n--- container log tail ---\n%s", err, logs)
 	}
+	mu.Lock()
+	byID[id] = sb
+	mu.Unlock()
 	return sb, nil
 }
 
@@ -309,6 +314,7 @@ func recoverExisting() {
 		sb := &sandbox{id: id, port: port, token: cfg.Gateway.Auth.Token,
 			dataDir: filepath.Join("build", "data-"+id)}
 		mu.Lock()
+		byID[id] = sb
 		if current == nil {
 			current = sb
 		}
@@ -360,8 +366,42 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 		current = sb
 		mu.Unlock()
 	}
+	chatWith(w, sb, in.Message)
+}
 
-	reply, err := sb.chat(in.Message)
+// POST /sandbox/{id}/chat — chat with the named sandbox (own container, own
+// session). This is the per-sandbox contract; /api/chat above is the
+// single-active-sandbox shortcut used by the web UI.
+func sandboxSubHandler(w http.ResponseWriter, r *http.Request) {
+	p := strings.TrimPrefix(r.URL.Path, "/sandbox/")
+	if r.Method == http.MethodPost && strings.HasSuffix(p, "/chat") {
+		id := strings.TrimSuffix(p, "/chat")
+		mu.Lock()
+		sb := byID[id]
+		mu.Unlock()
+		if sb == nil {
+			http.Error(w, "sandbox not found: "+id, http.StatusNotFound)
+			return
+		}
+		var in struct {
+			Message string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "bad json body", http.StatusBadRequest)
+			return
+		}
+		if in.Message == "" {
+			http.Error(w, "message required", http.StatusBadRequest)
+			return
+		}
+		chatWith(w, sb, in.Message)
+		return
+	}
+	deleteSandboxHandler(w, r)
+}
+
+func chatWith(w http.ResponseWriter, sb *sandbox, msg string) {
+	reply, err := sb.chat(msg)
 	if err != nil {
 		http.Error(w, "chat failed: "+err.Error(), http.StatusBadGateway)
 		return
@@ -402,6 +442,9 @@ func deleteSandboxHandler(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		sb := current
 		current = nil
+		if sb != nil {
+			delete(byID, sb.id)
+		}
 		mu.Unlock()
 		if sb == nil {
 			http.Error(w, "no sandbox", http.StatusNotFound)
@@ -410,6 +453,7 @@ func deleteSandboxHandler(w http.ResponseWriter, r *http.Request) {
 		id = sb.id
 	} else {
 		mu.Lock()
+		delete(byID, id)
 		if current != nil && current.id == id {
 			current = nil
 		}
@@ -445,7 +489,7 @@ func main() {
 	mux.HandleFunc("/api/chat", chatHandler)
 	mux.HandleFunc("/api/sandbox", sandboxInfoHandler)
 	mux.HandleFunc("/sandbox", createSandboxHandler)
-	mux.HandleFunc("/sandbox/", deleteSandboxHandler)
+	mux.HandleFunc("/sandbox/", sandboxSubHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

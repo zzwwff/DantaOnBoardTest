@@ -23,6 +23,7 @@ if [ "${1:-}" = "--no-pull" ]; then PULL=0; fi
 echo "==> [1/6] removing old sandbox containers + data"
 docker rm -f $(docker ps -aq --filter name=sbx-) 2>/dev/null || true
 rm -rf build/data-*
+rm -f build/sandboxes.map  # stale name->id aliases point at dead sandboxes
 
 if [ "$PULL" -eq 1 ]; then
   echo "==> [2/6] pulling OpenClaw image (ghcr.io, CN mirrors as fallback)"

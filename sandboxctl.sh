@@ -7,7 +7,7 @@
 #
 # Usage:
 #   ./sandboxctl.sh create <name>              create a sandbox and register <name>
-#   ./sandboxctl.sh send <name> [message]      chat with the active sandbox
+#   ./sandboxctl.sh send <name> [message]      chat with that sandbox
 #   ./sandboxctl.sh delete <name>              delete the sandbox and its mapping
 #   ./sandboxctl.sh list                       show the name mapping table
 #   ./sandboxctl.sh status                     show the active sandbox
@@ -48,8 +48,9 @@ send() {
   [ -n "$msg" ] || { printf 'message: '; read -r msg; }
   [ -n "$msg" ] || msg="ping"
 
-  # chat goes through the backend's single active sandbox
-  curl -s -X POST "$BACKEND/api/chat" \
+  # each name maps to its own sandbox (own container, own conversation);
+  # route by the real sandbox id so names never share a session
+  curl -s -X POST "$BACKEND/sandbox/$sid/chat" \
     -H 'Content-Type: application/json' \
     -d "{\"message\":\"$msg\"}"
   echo

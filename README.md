@@ -21,11 +21,13 @@ Browser ──HTTP──► backend (Go) :8080 ──docker CLI──► sandbox
                      ├─ GET   /api/sandbox  current id      DeepSeek model,
                      ├─ POST  /api/chat     {"message"}→{"reply"}    data dir mounted
                      ├─ POST  /sandbox      create sandbox           at /home/node/.openclaw
+                     ├─ POST  /sandbox/{id}/chat   chat with that sandbox
                      └─ DELETE /sandbox[/{id}]  delete sandbox
 ```
 
 - The backend generates `build/data-<id>/openclaw.json` per sandbox (chat-completions endpoint, gateway token, DeepSeek provider, default agent model) and mounts the whole dir at `/home/node/.openclaw` — config **and** agent memory persist there.
 - Chat uses the OpenAI `user` field (= sandbox id) as the stable session key, so the conversation lives inside the sandbox; the caller needs no session state.
+- Every sandbox is its own container **and its own conversation**: `POST /sandbox/{id}/chat` routes to that sandbox, `POST /api/chat` is the shortcut for the single active sandbox used by the web UI.
 - **Long residency**: containers have no idle reaper; on restart the backend rescans `sbx-*` containers and recovers the port map, so a sandbox survives backend restarts.
 - The sandbox is created lazily on the first chat message (or explicitly via `POST /sandbox`).
 
@@ -63,8 +65,9 @@ DantaOnBoardTest/
 |---|---|---|
 | GET | `/` | Chat UI |
 | GET | `/api/sandbox` | Current sandbox → `{"sandbox_id", "addr"}` |
-| POST | `/api/chat` | `{"message": "..."}` → `{"reply": "..."}` (creates the sandbox on first message) |
-| POST | `/sandbox` | Create sandbox → `{"sandbox_id", "addr"}` |
+| POST | `/api/chat` | `{"message": "..."}` → `{"reply": "..."}` (creates the sandbox on first message; routes to the active sandbox) |
+| POST | `/sandbox` | Create sandbox → `{"sandbox_id", "addr"}` (becomes active) |
+| POST | `/sandbox/{id}/chat` | `{"message": "..."}` → `{"reply": "..."}` — chat with that named sandbox (own container, own session); 404 if unknown |
 | DELETE | `/sandbox` or `/sandbox/{id}` | Delete sandbox (container + data dir) |
 
 ## Deploy
