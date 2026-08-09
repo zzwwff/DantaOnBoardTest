@@ -1,32 +1,58 @@
-// backend — sandbox management backend (Docker Provider MVP)
+// backend — sandbox management backend (OpenClaw provider)
 //
-// Three endpoints:
-//   POST   /sandbox            create sandbox -> {"sandbox_id": "...", "addr": "..."}
-//   DELETE /sandbox/{id}       delete sandbox
-//   POST   /sandbox/{id}/ping  body {"message": "..."} -> {"reply": "<msg> -sandbox- <id>"}
+// Each sandbox is one hardened OpenClaw gateway container backed by DeepSeek.
+// Endpoints:
+//   GET   /                    chat UI (web/index.html)
+//   GET   /api/sandbox         current sandbox info -> {"sandbox_id","addr"}
+//   POST  /api/chat            {"message": "..."} -> {"reply": "..."}
+//   POST  /sandbox             create sandbox -> {"sandbox_id","addr"}
+//   DELETE /sandbox            delete the current sandbox
+//   DELETE /sandbox/{id}       delete the named sandbox
 //
-// Note: "sandbox" is currently a Docker container managed via the docker CLI.
-// The API contract stays unchanged if the sandbox backend is later swapped to
-// CubeSandbox — only createSandbox/deleteSandbox internals change.
+// Env:
+//   LISTEN_ADDR       bind address (default 127.0.0.1:8080)
+//   DEEPSEEK_API_KEY  API key for DeepSeek (required to create a sandbox)
+//   WEB_DIR           directory with the chat UI (default ../web)
+//
+// Sandbox lifecycle: on start the backend scans existing sbx-* containers and
+// recovers the port map, so sandboxes survive backend restarts (long residency).
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
-const image = "pingpong:latest"
+const (
+	openclawImage = "ghcr.io/openclaw/openclaw:latest"
+	sandboxPort   = "18789" // gateway HTTP port inside the container
+	// the OpenClaw image runs as user "node" (uid 1000); data dirs must be
+	// owned by it so the gateway can write its state
+	containerUID = 1000
+)
+
+// sandbox tracks one OpenClaw container.
+type sandbox struct {
+	id      string
+	port    string // host port of the gateway
+	token   string // gateway auth token (also inside openclaw.json)
+	dataDir string // host dir mounted at /home/node/.openclaw
+}
 
 var (
-	mu    sync.RWMutex
-	ports = map[string]string{} // sandbox_id -> host port
+	mu      sync.Mutex
+	current *sandbox // the active sandbox (single-chat MVP)
 )
 
 type createResp struct {
@@ -34,7 +60,7 @@ type createResp struct {
 	Addr      string `json:"addr"`
 }
 
-type pingResp struct {
+type chatResp struct {
 	Reply string `json:"reply"`
 }
 
@@ -44,99 +70,351 @@ func sh(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// POST /sandbox
-func createSandbox(w http.ResponseWriter, r *http.Request) {
+func randomHex(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// writeConfig writes openclaw.json for a sandbox: chat-completions endpoint on,
+// token auth, DeepSeek provider, DeepSeek as the default agent model.
+func writeConfig(cfgPath, token, apiKey string) error {
+	cfg := map[string]any{
+		"gateway": map[string]any{
+			"auth": map[string]any{
+				"mode":  "token",
+				"token": token,
+			},
+			"http": map[string]any{
+				"endpoints": map[string]any{
+					"chatCompletions": map[string]any{"enabled": true},
+				},
+			},
+		},
+		"models": map[string]any{
+			"mode": "merge",
+			"providers": map[string]any{
+				"deepseek": map[string]any{
+					"baseUrl": "https://api.deepseek.com",
+					"apiKey":  apiKey,
+					"api":     "openai-completions",
+					"models": []any{
+						map[string]any{"id": "deepseek-chat", "contextWindow": 128000, "maxOutput": 8192},
+					},
+				},
+			},
+		},
+		"agents": map[string]any{
+			"defaults": map[string]any{
+				"model": map[string]any{"primary": "deepseek/deepseek-chat"},
+				"models": map[string]any{"allow": []any{"deepseek/deepseek-chat"}},
+			},
+		},
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(cfgPath, data, 0o600)
+}
+
+// hostPortOf extracts the mapped host port from "docker port" output
+// (one line per bound address; IPv4 first).
+func hostPortOf(name string) (string, error) {
+	out, err := sh("port", name, sandboxPort)
+	if err != nil {
+		return "", fmt.Errorf("%s (%w)", out, err)
+	}
+	first := strings.SplitN(out, "\n", 2)[0]
+	port := strings.TrimPrefix(first, "0.0.0.0:")
+	port = strings.TrimPrefix(port, "[::]:")
+	return port, nil
+}
+
+func newSandbox() (*sandbox, error) {
+	apiKey := os.Getenv("DEEPSEEK_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("DEEPSEEK_API_KEY not set")
+	}
+
+	id := "s" + fmt.Sprintf("%d", time.Now().UnixNano()%100000000)
+	name := "sbx-" + id
+	base := filepath.Join("build", "data-"+id)
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chown(base, containerUID, containerUID); err != nil {
+		return nil, err
+	}
+
+	token := randomHex(16)
+	cfgPath := filepath.Join(base, "openclaw.json")
+	if err := writeConfig(cfgPath, token, apiKey); err != nil {
+		return nil, err
+	}
+	if err := os.Chown(cfgPath, containerUID, containerUID); err != nil {
+		return nil, err
+	}
+	abs, err := filepath.Abs(base)
+	if err != nil {
+		return nil, err
+	}
+
+	// Hardened run: resource caps, no capabilities, no privilege escalation.
+	// The data dir is mounted at /home/node/.openclaw (config + agent state).
+	// The sandbox keeps running until removed (long residency, no reaper).
+	if out, err := sh("run", "-d", "--name", name,
+		"-p", sandboxPort,
+		"--memory", "512m", "--cpus", "1", "--pids-limit", "256",
+		"--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+		"-v", abs+":/home/node/.openclaw",
+		openclawImage); err != nil {
+		return nil, fmt.Errorf("docker run: %s (%w)", out, err)
+	}
+
+	port, err := hostPortOf(name)
+	if err != nil {
+		sh("rm", "-f", name)
+		return nil, fmt.Errorf("port lookup: %w", err)
+	}
+
+	sb := &sandbox{id: id, port: port, token: token, dataDir: base}
+
+	// Wait for the gateway to serve /v1/models before returning, so the first
+	// chat request never races the container boot.
+	if err := sb.waitReady(120 * time.Second); err != nil {
+		sh("rm", "-f", name)
+		return nil, err
+	}
+	return sb, nil
+}
+
+func (s *sandbox) waitReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	url := "http://127.0.0.1:" + s.port + "/v1/models"
+	client := &http.Client{Timeout: 5 * time.Second}
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Authorization", "Bearer "+s.token)
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("gateway not ready within %v", timeout)
+}
+
+// chat sends one user message to the gateway and returns the reply text.
+// The OpenAI "user" field is the sandbox id -> stable session key, so the
+// conversation state lives inside the sandbox (across requests, no sessions
+// needed on the caller side).
+func (s *sandbox) chat(msg string) (string, error) {
+	body, err := json.Marshal(map[string]any{
+		"model": "openclaw",
+		"user":  s.id,
+		"messages": []any{
+			map[string]string{"role": "user", "content": msg},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest("POST",
+		"http://127.0.0.1:"+s.port+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.token)
+	req.Header.Set("x-openclaw-model", "deepseek/deepseek-chat")
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gateway unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("gateway HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("bad gateway response: %w", err)
+	}
+	if len(out.Choices) == 0 {
+		return "", fmt.Errorf("empty gateway response")
+	}
+	reply := strings.TrimSpace(out.Choices[0].Message.Content)
+	if reply == "" {
+		reply = "(no text reply)"
+	}
+	return reply, nil
+}
+
+func ensureSandbox() *sandbox {
+	mu.Lock()
+	defer mu.Unlock()
+	return current
+}
+
+// recoverExisting rebuilds the in-memory state from containers that are still
+// running (long residency across backend restarts).
+func recoverExisting() {
+	out, err := sh("ps", "-a", "--filter", "name=sbx-", "--format", "{{.Names}}")
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(out) {
+		if !strings.HasPrefix(name, "sbx-") {
+			continue
+		}
+		id := strings.TrimPrefix(name, "sbx-")
+		cfgPath := filepath.Join("build", "data-"+id, "openclaw.json")
+		raw, err := os.ReadFile(cfgPath)
+		if err != nil {
+			continue
+		}
+		var cfg struct {
+			Gateway struct {
+				Auth struct {
+					Token string `json:"token"`
+				} `json:"auth"`
+			} `json:"gateway"`
+		}
+		if json.Unmarshal(raw, &cfg) != nil || cfg.Gateway.Auth.Token == "" {
+			continue
+		}
+		port, err := hostPortOf(name)
+		if err != nil {
+			continue
+		}
+		sb := &sandbox{id: id, port: port, token: cfg.Gateway.Auth.Token,
+			dataDir: filepath.Join("build", "data-"+id)}
+		mu.Lock()
+		if current == nil {
+			current = sb
+		}
+		mu.Unlock()
+		fmt.Printf("recovered sandbox %s on 127.0.0.1:%s\n", id, port)
+	}
+}
+
+// GET /api/sandbox
+func sandboxInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sb := ensureSandbox()
+	if sb == nil {
+		http.Error(w, "no sandbox yet", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, createResp{SandboxID: sb.id, Addr: "http://127.0.0.1:" + sb.port})
+}
+
+// POST /api/chat — create the sandbox lazily on the first message.
+func chatHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	id := fmt.Sprintf("s%d", time.Now().UnixNano()%100000000)
-	name := "sbx-" + id
-
-	// Create the sandbox; "-p 49999" without a host port binds a random host
-	// port, so concurrent creates never conflict.
-	if out, err := sh("run", "-d", "--name", name,
-		"-e", "SANDBOX_ID="+id, "-p", "49999", image); err != nil {
-		http.Error(w, "create failed: "+out, http.StatusInternalServerError)
+	var in struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad json body", http.StatusBadRequest)
+		return
+	}
+	if in.Message == "" {
+		http.Error(w, "message required", http.StatusBadRequest)
 		return
 	}
 
-	// Resolve the mapped port: "docker port <name> 49999" prints one line per
-	// bound address (e.g. "0.0.0.0:32768" and "[::]:32768"); take the first.
-	out, err := sh("port", name, "49999")
+	sb := ensureSandbox()
+	if sb == nil {
+		var err error
+		if sb, err = newSandbox(); err != nil {
+			http.Error(w, "create sandbox failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		current = sb
+		mu.Unlock()
+	}
+
+	reply, err := sb.chat(in.Message)
 	if err != nil {
-		http.Error(w, "port lookup failed: "+out, http.StatusInternalServerError)
+		http.Error(w, "chat failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	first := strings.SplitN(out, "\n", 2)[0]
-	hostPort := strings.TrimPrefix(first, "0.0.0.0:")
-	hostPort = strings.TrimPrefix(hostPort, "[::]:")
-
-	mu.Lock()
-	ports[id] = hostPort
-	mu.Unlock()
-
-	writeJSON(w, createResp{SandboxID: id, Addr: "http://127.0.0.1:" + hostPort})
+	writeJSON(w, chatResp{Reply: reply})
 }
 
-// DELETE /sandbox/{id}
-func deleteSandbox(w http.ResponseWriter, r *http.Request) {
+// POST /sandbox — explicit create; DELETE /sandbox — delete the current sandbox.
+func createSandboxHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		sb, err := newSandbox()
+		if err != nil {
+			http.Error(w, "create failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		current = sb
+		mu.Unlock()
+		writeJSON(w, createResp{SandboxID: sb.id, Addr: "http://127.0.0.1:" + sb.port})
+	case http.MethodDelete:
+		// DELETE /sandbox (no id) — handled here; DELETE /sandbox/{id} hits the
+		// "/sandbox/" pattern below.
+		deleteSandboxHandler(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func deleteSandboxHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/sandbox/")
+	id := strings.TrimPrefix(r.URL.Path, "/sandbox")
+	id = strings.Trim(id, "/")
 	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
-		return
+		mu.Lock()
+		sb := current
+		current = nil
+		mu.Unlock()
+		if sb == nil {
+			http.Error(w, "no sandbox", http.StatusNotFound)
+			return
+		}
+		id = sb.id
+	} else {
+		mu.Lock()
+		if current != nil && current.id == id {
+			current = nil
+		}
+		mu.Unlock()
 	}
-
-	mu.Lock()
-	delete(ports, id)
-	mu.Unlock()
 
 	if out, err := sh("rm", "-f", "sbx-"+id); err != nil {
 		http.Error(w, "delete failed: "+out, http.StatusInternalServerError)
 		return
 	}
+	os.RemoveAll(filepath.Join("build", "data-"+id))
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// POST /sandbox/{id}/ping
-func pingSandbox(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	id := strings.TrimPrefix(r.URL.Path, "/sandbox/")
-	id = strings.TrimSuffix(id, "/ping")
-
-	mu.RLock()
-	hostPort, ok := ports[id]
-	mu.RUnlock()
-	if !ok {
-		http.Error(w, "sandbox not found: "+id, http.StatusNotFound)
-		return
-	}
-
-	body, _ := io.ReadAll(r.Body)
-	msg := string(body)
-	if msg == "" {
-		msg = "ping"
-	}
-
-	// Forward to the sandbox service and return the signed message as-is.
-	resp, err := http.Post("http://127.0.0.1:"+hostPort+"/", "text/plain",
-		strings.NewReader(msg))
-	if err != nil {
-		http.Error(w, "sandbox unreachable: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	reply, _ := io.ReadAll(resp.Body)
-
-	writeJSON(w, pingResp{Reply: string(reply)})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -149,16 +427,24 @@ func main() {
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:8080"
 	}
+	webDir := os.Getenv("WEB_DIR")
+	if webDir == "" {
+		webDir = "../web"
+	}
+
+	recoverExisting()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/sandbox", createSandbox)
-	mux.HandleFunc("/sandbox/", func(w http.ResponseWriter, r *http.Request) {
-		p := strings.TrimPrefix(r.URL.Path, "/sandbox/")
-		if strings.HasSuffix(p, "/ping") {
-			pingSandbox(w, r)
+	mux.HandleFunc("/api/chat", chatHandler)
+	mux.HandleFunc("/api/sandbox", sandboxInfoHandler)
+	mux.HandleFunc("/sandbox", createSandboxHandler)
+	mux.HandleFunc("/sandbox/", deleteSandboxHandler)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
 			return
 		}
-		deleteSandbox(w, r)
+		http.ServeFile(w, r, filepath.Join(webDir, "index.html"))
 	})
 
 	fmt.Println("backend listening on", listenAddr)

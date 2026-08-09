@@ -7,15 +7,18 @@
 #
 # Usage:
 #   ./sandboxctl.sh create <name>              create a sandbox and register <name>
-#   ./sandboxctl.sh send <name> [message]      send a message to that sandbox
+#   ./sandboxctl.sh send <name> [message]      chat with the active sandbox
 #   ./sandboxctl.sh delete <name>              delete the sandbox and its mapping
 #   ./sandboxctl.sh list                       show the name mapping table
+#   ./sandboxctl.sh status                     show the active sandbox
 #   ./sandboxctl.sh                            interactive menu
 set -euo pipefail
 cd "$(dirname "$0")"
 
 BACKEND="${BACKEND_URL:-http://127.0.0.1:8080}"
-MAP_FILE="${SANDBOX_MAP:-./sandboxes.map}"
+MAP_FILE="${SANDBOX_MAP:-./build/sandboxes.map}"   # runtime state, gitignored
+
+mkdir -p "$(dirname "$MAP_FILE")"
 
 # name <tab> sandbox_id <tab> addr   (one line per sandbox)
 sid_of() { grep -P "^$1\t" "$MAP_FILE" | cut -f2 | head -1; }
@@ -45,7 +48,10 @@ send() {
   [ -n "$msg" ] || { printf 'message: '; read -r msg; }
   [ -n "$msg" ] || msg="ping"
 
-  curl -s -X POST "$BACKEND/sandbox/$sid/ping" -d "$msg"
+  # chat goes through the backend's single active sandbox
+  curl -s -X POST "$BACKEND/api/chat" \
+    -H 'Content-Type: application/json' \
+    -d "{\"message\":\"$msg\"}"
   echo
 }
 
@@ -71,6 +77,11 @@ list() {
   cat "$MAP_FILE"
 }
 
+status() {
+  curl -s "$BACKEND/api/sandbox"
+  echo
+}
+
 menu() {
   while true; do
     echo
@@ -94,6 +105,7 @@ case "${1:-menu}" in
   send)   send "${2:-}" "${3:-}" ;;
   delete) delete "${2:-}" ;;
   list)   list ;;
+  status) status ;;
   menu|"") menu ;;
-  *) echo "usage: $0 {create <name> | send <name> [msg] | delete <name> | list | menu}"; exit 1 ;;
+  *) echo "usage: $0 {create <name> | send <name> [msg] | delete <name> | list | status | menu}"; exit 1 ;;
 esac

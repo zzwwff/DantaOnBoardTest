@@ -7,45 +7,45 @@
 - `/mnt/data` 是 ext4（非 XFS）
 - **CubeSandbox 无法在这台机器上运行（任何模式）**
 
-**已选定方案 B：Docker 容器当"沙盒"**，验证控制面模式；接口契约与未来 CubeSandbox 保持一致。
+**已选定方案 B：Docker 容器当"沙盒"**，验证控制面模式；接口契约与未来 CubeSandbox 保持一致。方案论证见 `DockerDecision.md`。
 
-## 当前任务（Docker MVP）
+## 里程碑 1 — pingpong 控制面验证 ✅ 已完成（2026-08-09）
 
-### Phase 0 — 环境检查（claw 上执行）
+- [x] 环境检查（Docker 28.2.2、Go 1.22.2、端口空闲、32Gi/16核）
+- [x] pingpong 镜像构建（国内镜像源：docker.xuanyuan.me / docker.1ms.run / docker.m.daocloud.io；buildx 用 `docker buildx use default` 走宿主 daemon 的镜像源）
+- [x] 三接口联调：create → ping（消息+沙盒ID 签名回显）→ delete
+- [x] 单实例内存实测：**~1.8 MiB**（静态 Go + alpine，5 容器合计 <10 MiB，已写入论证）
+- [x] 沙盒过夜驻留验证
+- [x] 代码保留在 `pingpong/`（历史参考）
 
-- [ ] `docker version && docker info --format '{{.ServerVersion}} / {{.OperatingSystem}}'`
-- [ ] `docker ps`（确认 8080 无冲突）
-- [ ] `ss -tlnp | grep -E '8080|49999'`（期望无输出）
-- [ ] `go version`（有则服务器编译；无则用 Windows 交叉编译产物）
-- [ ] `free -h`、`df -h /root`、`nproc`
+## 里程碑 2 — OpenClaw 聊天沙盒（当前）✅ 代码已就绪（2026-08-09）
 
-### Phase 1 — 构建 pingpong 镜像 ✅ 代码已就绪（2026-08-08）
+每个沙盒 = 一个加固的 OpenClaw 网关容器（DeepSeek 模型），浏览器网页直接对话，不分 session。
 
-- [x] pingpong/main.go + Dockerfile 已写好（pingpong/）
-- [ ] 上机执行：`cd pingpong && docker build -t pingpong:latest .`
-- [ ] 单独验证：`docker run -d -e SANDBOX_ID=test123 -p 49999 pingpong:latest` + curl
+- [x] backend 重写：`/api/chat`、`/api/sandbox`、create/delete、启动时恢复沙盒端口映射
+- [x] `openclaw.json` 自动生成：开启 chatCompletions、token 鉴权、DeepSeek provider、默认模型 deepseek/deepseek-chat
+- [x] 沙盒加固参数：`--memory 512m --cpus 1 --pids-limit 256 --cap-drop ALL --security-opt no-new-privileges`
+- [x] web 聊天页（单文件、无外部依赖）
+- [x] deploy.sh：镜像拉取（ghcr.io + 国内镜像回退）+ API key 管理 + 构建 + 健康检查
+- [ ] **上机执行**：`./deploy.sh`（首次跑通全部流程）
+- [ ] 验证：第一条消息自动建沙盒、DeepSeek 回复、对话记忆跨消息保持
+- [ ] 验证：后端重启后沙盒恢复、仍可对话
+- [ ] 验证：`docker stats` 内存上限 512m、过夜驻留
+- [ ] 验证：删除沙盒清掉容器和数据目录
 
-### Phase 2 — 后端 ✅ 代码已就绪（2026-08-08）
+## Phase 4 — 后续演进
 
-- [x] backend/main.go + go.mod 已写好（纯标准库，LISTEN_ADDR 可配，默认 127.0.0.1:8080）
-- [ ] 上机执行：`cd backend && go build -o backend . && ./backend`（或拷贝 Linux 交叉编译产物）
-
-### Phase 3 — 端到端联调
-
-- [ ] `POST /sandbox` → 返回 sandbox_id + addr
-- [ ] `POST /sandbox/{id}/ping` → 返回"msg -sandbox- id"
-- [ ] 沙盒过夜驻留后仍可 ping
-- [ ] `DELETE /sandbox/{id}` → 容器被删除
-- [ ] 记录真实资源占用（单个沙盒容器内存）
-
-### Phase 4 — 后续演进（不动接口，只换实现）
-
-- [ ] 找外层 PVE 管理员：能否开一台嵌套虚拟化 VM（CPU type=host + nested）→ 届时 `/dev/kvm` 可用
-- [ ] 在那台 VM 上部署 CubeSandbox 集群（回头参考 README 里 CubeSandbox 架构说明）
+- [ ] 出网收窄：沙盒 egress 白名单（只放 DeepSeek API），iptables 或代理
+- [ ] 只读根文件系统：`--read-only`（需先审计 OpenClaw 可写路径）
+- [ ] 后端鉴权：Bearer token（当前只绑 127.0.0.1，暴露公网前必办）
+- [ ] gVisor（runsc）运行时：无 KVM 下的内核级隔离（claw 可直接装）
+- [ ] 找外层 PVE 管理员：嵌套虚拟化 VM（CPU type=host + nested）→ 届时可上 Kata/microVM 或原 CubeSandbox 方案
 - [ ] backend 内部实现从 Docker CLI 换成 E2B 兼容 API
 
 ## 已知坑（预判）
 
-- **CubeSandbox 的 PVM 模式在此机器不可行**（LXC 内无法换宿主内核）
-- 嵌套虚拟化需要外层 PVE 配合，这是未来部署 CubeSandbox 的前提
-- 后端当前无鉴权、只绑 127.0.0.1，上线前需加 token（对应项目"openclaw 专用凭证"）
+- **ghcr.io 拉取**：中国网络可能超时，deploy.sh 已内置镜像回退（ghcr.nju.edu.cn → ghcr.m.daocloud.io）
+- **容器内 user**：OpenClaw 镜像以 node（uid 1000）运行，数据目录需 chown 1000:1000，backend 已处理；若后续镜像改 uid 需同步改
+- **首次回复慢**：沙盒冷启动 + DeepSeek 推理，第一条消息 1-2 分钟属正常（前端有"思考中"提示）
+- **DeepSeek 模型引用**：用 `deepseek/deepseek-chat`（provider/model 格式）；若报 Unknown model，容器内跑 `openclaw models list` 排查
+- 后端当前无鉴权、只绑 127.0.0.1，暴露公网前需加 token（对应项目"openclaw 专用凭证"）

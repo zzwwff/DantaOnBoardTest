@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Danta OnBoard Chat</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --bubble: #232733;
+    --accent: #4f8cff; --text: #e8eaed; --muted: #9aa0a6; --danger: #ff7b72;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid #262b36;
+    display: flex; align-items: center; gap: 12px;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sid {
+    color: var(--muted); font-size: 12px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  header button {
+    margin-left: auto; background: transparent; color: var(--muted);
+    border: 1px solid #333a46; border-radius: 6px; padding: 5px 12px;
+    cursor: pointer; font-size: 12px;
+  }
+  header button:hover { color: var(--text); border-color: #4a5264; }
+  #messages {
+    flex: 1; overflow-y: auto; padding: 20px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .msg {
+    max-width: 72%; padding: 10px 14px; border-radius: 12px;
+    line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  }
+  .user { align-self: flex-end; background: var(--accent); color: #fff; }
+  .bot { align-self: flex-start; background: var(--bubble); }
+  .typing { align-self: flex-start; color: var(--muted); font-size: 13px; padding: 4px 8px; }
+  .error { align-self: flex-start; color: var(--danger); font-size: 13px; }
+  #inputbar {
+    padding: 14px 20px; background: var(--panel); border-top: 1px solid #262b36;
+    display: flex; gap: 10px;
+  }
+  #input {
+    flex: 1; background: #10131a; border: 1px solid #333a46; border-radius: 8px;
+    color: var(--text); padding: 10px 14px; font-size: 14px;
+    outline: none; resize: none; height: 44px;
+  }
+  #input:focus { border-color: var(--accent); }
+  #send {
+    background: var(--accent); border: none; border-radius: 8px;
+    color: #fff; padding: 0 20px; font-size: 14px; cursor: pointer;
+  }
+  #send:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Danta OnBoard Chat</h1>
+  <span class="sid" id="sid">sandbox: -</span>
+  <button id="reset">重置沙盒</button>
+</header>
+
+<div id="messages"></div>
+
+<div id="inputbar">
+  <textarea id="input" placeholder="和你的 AI 沙盒聊聊…（Enter 发送，Shift+Enter 换行）"></textarea>
+  <button id="send">发送</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const msgs = $("messages"), input = $("input"), send = $("send");
+let busy = false;
+
+function add(cls, text) {
+  const div = document.createElement("div");
+  div.className = cls;
+  div.textContent = text;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+  return div;
+}
+
+async function refreshSid() {
+  try {
+    const r = await fetch("/api/sandbox");
+    if (r.ok) {
+      const d = await r.json();
+      $("sid").textContent = "sandbox: " + d.sandbox_id;
+    }
+  } catch (e) { /* backend not up yet — ignore */ }
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text || busy) return;
+  input.value = "";
+  add("msg user", text);
+  busy = true;
+  send.disabled = true;
+  const t = add("typing", "思考中…（沙盒首次启动可能需要一两分钟）");
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text })
+    });
+    const raw = await r.text();
+    let d;
+    try { d = JSON.parse(raw); } catch (e) { d = { error: raw }; }
+    t.remove();
+    if (!r.ok) { add("error", "出错了: " + (d.error || r.status)); return; }
+    add("msg bot", d.reply);
+    refreshSid();
+  } catch (e) {
+    t.remove();
+    add("error", "网络错误: " + e);
+  } finally {
+    busy = false;
+    send.disabled = false;
+    input.focus();
+  }
+}
+
+send.onclick = sendMessage;
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+$("reset").onclick = async () => {
+  if (!confirm("删除当前沙盒并重建？对话记忆会丢失。")) return;
+  try {
+    const r = await fetch("/sandbox", { method: "DELETE" });
+    if (r.ok) {
+      add("bot", "沙盒已重置，下一条消息会创建新沙盒。");
+      $("sid").textContent = "sandbox: -";
+      msgs.innerHTML = "";
+    } else {
+      add("error", "重置失败: HTTP " + r.status);
+    }
+  } catch (e) {
+    add("error", "网络错误: " + e);
+  }
+};
+
+refreshSid();
+</script>
+</body>
+</html>

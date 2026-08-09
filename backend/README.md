@@ -1,51 +1,67 @@
-# backend — sandbox management backend (Docker Provider MVP)
+# backend — sandbox management backend (OpenClaw provider)
 
-Exposes 3 HTTP endpoints and manages "sandboxes" (currently Docker containers).
+Go stdlib-only backend: exposes the chat API and manages "sandboxes" (currently hardened OpenClaw gateway containers with a DeepSeek model).
 
 ## Endpoints
 
 | Method | Path | Behavior |
 |---|---|---|
-| POST | `/sandbox` | Create sandbox → `{"sandbox_id": "...", "addr": "http://127.0.0.1:<port>"}` |
-| DELETE | `/sandbox/{id}` | Delete sandbox |
-| POST | `/sandbox/{id}/ping` | body `{"message": "..."}` → `{"reply": "<message> -sandbox- <id>"}` |
+| GET | `/` | Chat UI (served from `../web`) |
+| GET | `/api/sandbox` | Current sandbox → `{"sandbox_id", "addr"}` |
+| POST | `/api/chat` | `{"message": "..."}` → `{"reply": "..."}` — creates the sandbox on the first message |
+| POST | `/sandbox` | Create sandbox → `{"sandbox_id", "addr"}` |
+| DELETE | `/sandbox` or `/sandbox/{id}` | Delete sandbox (container + data dir) |
 
-## Architecture (current)
+## Architecture
 
 ```
-Caller ──HTTP──► backend :8080 ──docker CLI──► sandbox container (pingpong)
-                    │                              │
-                    └─ port map (in-memory)        └─ random host port ← 127.0.0.1:<port>
+Caller ──HTTP──► backend :8080 ──docker CLI──► sandbox container (OpenClaw gateway :18789)
+                     │                              │
+                     ├─ build/data-<id>/            └─ DeepSeek model, data dir at /home/node/.openclaw
+                     │    openclaw.json (generated)
+                     └─ port map (in-memory, rebuilt on start)
 ```
 
-- Create: `docker run -d -p 49999` (random host port, no conflicts); sandbox ID injected via the `SANDBOX_ID` env var
-- Communicate: HTTP forwarded to `127.0.0.1:<host-port>/`
-- Long residency: containers live until removed; no idle reaper
+- Create: `docker run` with hardening flags (`--memory 512m --cpus 1 --pids-limit 256 --cap-drop ALL --security-opt no-new-privileges`), the generated config dir mounted at `/home/node/.openclaw`, and a random host port for 18789.
+- The generated `openclaw.json` enables the `/v1/chat/completions` endpoint, sets token auth (`gateway.auth.token`, random per sandbox), registers the DeepSeek provider (`models.providers.deepseek`, `api: "openai-completions"`), and makes `deepseek/deepseek-chat` the default agent model.
+- Chat: forward to `POST 127.0.0.1:<port>/v1/chat/completions` with `model: "openclaw"`, `user: <sandbox_id>` (stable session key → conversation state lives in the sandbox), and the gateway bearer token.
+- Recovery: on start the backend scans `sbx-*` containers, reads each token from its `openclaw.json`, and rebuilds the port map — sandboxes survive backend restarts (long residency).
+- Long residency: containers have no idle reaper; they live until deleted.
 
 ## Dependencies
 
-- docker CLI on the host (already present on claw)
-- Image `pingpong:latest` (build first, see pingpong/README.md)
+- docker CLI on the host
+- Image `ghcr.io/openclaw/openclaw:latest` (pulled by `deploy.sh`, CN mirrors as fallback)
 - Go standard library only, no third-party deps
+
+## Env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `LISTEN_ADDR` | `127.0.0.1:8080` | bind address |
+| `DEEPSEEK_API_KEY` | — | required to create a sandbox |
+| `WEB_DIR` | `../web` | directory with the chat UI |
 
 ## Build & run
 
 ```bash
 cd backend
-go build -o backend .
-./backend        # listens on 127.0.0.1:8080 (override with LISTEN_ADDR)
+go build -o ../build/backend .
+DEEPSEEK_API_KEY=sk-xxx ../build/backend
 ```
+
+(Prefer `./deploy.sh` at the repo root — it does image pull, key handling, build, start and health check.)
 
 ## Try it
 
 ```bash
-# create
-curl -X POST localhost:8080/sandbox
-# {"sandbox_id":"s12345678","addr":"http://127.0.0.1:32768"}
+# chat (boots the sandbox on the first call; first reply may take 1-2 min)
+curl -X POST localhost:8080/api/chat -H 'Content-Type: application/json' -d '{"message":"hi"}'
+# {"reply":"..."}
 
-# ping
-curl -X POST localhost:8080/sandbox/s12345678/ping -d 'hello'
-# {"reply":"hello -sandbox- s12345678"}
+# current sandbox
+curl -s localhost:8080/api/sandbox
+# {"sandbox_id":"s12345678","addr":"http://127.0.0.1:32768"}
 
 # delete
 curl -X DELETE localhost:8080/sandbox/s12345678
@@ -54,10 +70,10 @@ curl -X DELETE localhost:8080/sandbox/s12345678
 ## Future: swap to CubeSandbox
 
 Contract unchanged; replace internals only:
-- `createSandbox` → E2B-compatible API (`E2B_API_URL` / `CUBE_TEMPLATE_ID` / `NEVER_TIMEOUT`)
+- `newSandbox` → E2B-compatible API (`E2B_API_URL` / `CUBE_TEMPLATE_ID` / `NEVER_TIMEOUT`)
 - `deleteSandbox` → `sandbox.kill()`
-- ping → CubeProxy `<port>-<id>.<domain>`
+- chat → CubeProxy `<port>-<id>.<domain>`
 
 ## Status
 
-✅ MVP code ready (Docker Provider), pending on-server deployment & verification
+✅ Code ready (OpenClaw provider), pending on-server deployment & verification
