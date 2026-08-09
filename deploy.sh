@@ -59,7 +59,9 @@ echo "==> [4/6] compiling backend"
 (cd backend && go build -o ../build/backend .)
 
 echo "==> [5/6] restarting backend"
-pkill -f '/build/backend' 2>/dev/null || true
+# stop any previous backend: new layout is ./build/backend, the milestone-1 one
+# was ./backend started from the backend/ dir — one pattern matches both
+pkill -f '\./backend' 2>/dev/null || true
 sleep 1
 DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" nohup ./build/backend > build/backend.log 2>&1 &
 sleep 1
